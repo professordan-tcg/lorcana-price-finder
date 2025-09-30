@@ -1,18 +1,20 @@
 "use client";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-
-// Lightweight fuzzy ranker for OCR -> card match
 import Fuse from "fuse.js";
 
-// NOTE: tesseract.js downloads worker & trained data in the browser.
-// Keep this page client-only.
+// OpenCV.js is big; load from CDN on demand
+const OPENCV_CDN = "https://docs.opencv.org/4.x/opencv.js";
+
+// NOTE: tesseract.js + OpenCV.js are loaded dynamically in the browser.
 let Tesseract = null;
+let cv = null;
 
 export default function ScanPage() {
-  const [ready, setReady] = useState(false);
+  const [readyOCR, setReadyOCR] = useState(false);
+  const [readyCV, setReadyCV] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [currency, setCurrency] = useState("GBP"); // reuse your GBP toggle
-  const [printing, setPrinting] = useState("");    // Normal / Foil (optional)
+  const [currency, setCurrency] = useState("GBP");
+  const [printing, setPrinting] = useState("");
   const [status, setStatus] = useState("Idle");
   const [error, setError] = useState(null);
 
@@ -25,20 +27,21 @@ export default function ScanPage() {
   const loopRef = useRef(null);
   const cooldownRef = useRef(0);
 
-  // ---------- helpers ----------
+  // ---------- utilities ----------
   const fmt = useCallback(
     (n) => new Intl.NumberFormat(undefined, { style: "currency", currency }).format(n),
     [currency]
   );
-
   const expandCond = (abbr) => {
     const map = { NM: "Near Mint", LP: "Lightly Played", MP: "Moderately Played", HP: "Heavily Played", DMG: "Damaged", S: "Sealed" };
     return map[abbr] || abbr;
   };
   const NM = "NM";
   const NM_FULL = expandCond(NM);
+  const normalize = (s) =>
+    (s || "").toLowerCase().replace(/[^\w\s\-'/]/g, " ").replace(/\s+/g, " ").trim();
 
-  function bestPriceNM(variants = []) {
+  const bestPriceNM = (variants = []) => {
     let vs = variants.filter((v) => v?.condition === NM_FULL || v?.condition === NM);
     if (printing) vs = vs.filter((v) => (v.printing || "").toLowerCase() === printing.toLowerCase());
     if (!vs.length) return null;
@@ -47,17 +50,9 @@ export default function ScanPage() {
       if (typeof v.price === "number" && (best.price == null || v.price < best.price)) best = v;
     }
     return best;
-  }
+  };
 
-  function normalize(s) {
-    return (s || "")
-      .toLowerCase()
-      .replace(/[^\w\s\-']/g, " ")     // strip funky chars
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  // ---------- init Tesseract (client side) ----------
+  // ---------- dynamic loaders ----------
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -66,28 +61,48 @@ export default function ScanPage() {
         const mod = await import("tesseract.js");
         if (!mounted) return;
         Tesseract = mod.default || mod;
-        setReady(true);
+        setReadyOCR(true);
         setStatus("OCR ready");
       } catch (e) {
         setError("Failed to load OCR. Check network and try again.");
         setStatus("Error");
       }
     })();
-    return () => (mounted = false);
+    return () => { mounted = false; };
   }, []);
 
-  // ---------- camera controls ----------
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      setStatus((s) => (s.includes("Error") ? s : "Loading vision engine…"));
+      if (window.cv) {
+        cv = window.cv;
+        if (mounted) setReadyCV(true);
+        setStatus("Engines ready");
+        return;
+      }
+      await loadScript(OPENCV_CDN);
+      // Wait until OpenCV signals it’s initialized
+      await waitFor(() => window.cv && window.cv.Mat);
+      cv = window.cv;
+      if (!mounted) return;
+      setReadyCV(true);
+      setStatus("Engines ready");
+    })().catch(() => {
+      setError("Failed to load computer vision engine.");
+      setStatus("Error");
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  // ---------- camera ----------
   const startCamera = useCallback(async () => {
     setError(null);
     setMatch(null);
     setStatus("Requesting camera…");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment", // prefer back camera on phones
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
       if (videoRef.current) {
@@ -100,20 +115,19 @@ export default function ScanPage() {
       setStatus("Error");
     }
   }, []);
-
   const stopCamera = useCallback(() => {
     const v = videoRef.current;
-    if (v && v.srcObject) {
+    if (v?.srcObject) {
       for (const t of v.srcObject.getTracks()) t.stop();
       v.srcObject = null;
     }
   }, []);
 
-  // ---------- OCR loop ----------
+  // ---------- scanner loop ----------
   const runOnce = useCallback(async () => {
     if (!Tesseract || !videoRef.current || !canvasRef.current) return;
 
-    // avoid hammering: 1 pass / 1200ms
+    // throttle passes to ~1/1.2s
     if (cooldownRef.current && Date.now() - cooldownRef.current < 1200) return;
     cooldownRef.current = Date.now();
 
@@ -121,94 +135,139 @@ export default function ScanPage() {
     const c = canvasRef.current;
     const ctx = c.getContext("2d", { willReadFrequently: true });
 
-    // Size canvas to a decent resolution for OCR (keep small to be fast)
-    const W = 720;
-    const H = Math.round((v.videoHeight / v.videoWidth) * W) || 480;
-    c.width = W;
-    c.height = H;
-
-    // Draw current frame
+    // draw full frame (downscaled for speed)
+    const W = 960;
+    const H = Math.round((v.videoHeight / v.videoWidth) * W) || 540;
+    c.width = W; c.height = H;
     ctx.drawImage(v, 0, 0, W, H);
 
-    // Crop the top band (card name area ~ top 18%); improve with a slider later
-    const nameBandH = Math.round(H * 0.18);
-    const nameBand = ctx.getImageData(0, 0, W, nameBandH);
-
-    // Build a temp canvas for the crop (Tesseract likes an <img> or canvas)
-    const crop = document.createElement("canvas");
-    crop.width = W;
-    crop.height = nameBandH;
-    crop.getContext("2d").putImageData(nameBand, 0, 0);
-
+    // 1) FULL FRAME OCR (text anywhere)
     setStatus("Reading card text…");
-    const { data } = await Tesseract.recognize(crop, "eng", {
-      // logger: (m) => console.log(m), // uncomment for debugging
-    });
-    const text = normalize(data?.text || "");
+    const { data } = await Tesseract.recognize(c, "eng");
+    const textFull = data?.text || "";
     const words = (data?.words || []).filter((w) => (w?.text || "").trim().length > 0);
-    const confAvg =
-      words.length ? Math.round(words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length) : null;
-
+    const confAvg = words.length ? Math.round(words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length) : null;
     setConfidence(confAvg);
-    if (!text || text.length < 3) {
-      setStatus("No text detected. Hold card steady with name near top edge.");
-      return;
-    }
 
-    // Try to extract a plausible name line (first line, or the longest)
-    const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-    const nameGuess = (lines[0] || lines.sort((a, b) => b.length - a.length)[0] || "").trim();
+    // Heuristic: likely name = longest line near top third OR longest overall
+    const lines = textFull.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    const topThirdLimit = Math.floor(lines.length * 0.33);
+    const topCandidates = lines.slice(0, Math.max(topThirdLimit, 1));
+    const longestTop = topCandidates.sort((a, b) => b.length - a.length)[0] || "";
+    const longestOverall = [...lines].sort((a, b) => b.length - a.length)[0] || "";
+    const nameGuess = (longestTop.length >= 4 ? longestTop : longestOverall).trim();
 
-    if (!nameGuess) {
-      setStatus("Reading…");
-      return;
-    }
+    // 2) COLLECTOR NUMBER OCR (regex like 123/204)
+    const numMatch = textFull.match(/\b(\d{1,3})\s*\/\s*(\d{1,3})\b/);
+    const collectorNum = numMatch ? numMatch[1] : null; // we use left side (card number)
 
-    // Skip if same as last to reduce spam
-    if (normalize(nameGuess) === normalize(lastQuery)) {
-      setStatus(`Detected: “${nameGuess}” (${confAvg || "?"}%)`);
+    // Skip if nothing meaningful
+    if (!nameGuess || normalize(nameGuess) === normalize(lastQuery)) {
+      setStatus(nameGuess ? `Detected: “${nameGuess}” (${confAvg || "?"}%)` : "No text detected yet…");
       return;
     }
     setLastQuery(nameGuess);
-    setStatus(`Detected: “${nameGuess}” (${confAvg || "?"}%) — searching…`);
+    setStatus(`Detected: “${nameGuess}”${collectorNum ? ` #${collectorNum}` : ""} — searching…`);
 
-    // Query your own API (fast, cached) — NM only, images off for speed
+    // 3) TEXT SEARCH (NM only, images=1 so we can compare visually)
     const qs = new URLSearchParams({
       q: nameGuess,
-      limit: "12",
+      limit: "20",
       currency,
       condition: "NM",
-      images: "0",
+      images: "1",
     }).toString();
-
     const res = await fetch(`/api/cards?${qs}`, { cache: "no-store" });
     const json = await res.json().catch(() => ({}));
     if (!res.ok || !Array.isArray(json?.data)) {
       setStatus("Search failed. Retrying…");
       return;
     }
+    let candidates = json.data;
 
-    const candidates = json.data;
-
-    // Fuzzy rank against API results (prefer exact/near name matches)
+    // 4) TEXT RANK (Fuse)
     const fuse = new Fuse(candidates, {
       includeScore: true,
-      threshold: 0.35, // stricter is better for on-stream
+      threshold: 0.38,
       keys: [
-        { name: "name", weight: 0.7 },
-        { name: "set", weight: 0.2 },
-        { name: "number", weight: 0.1 },
+        { name: "name",   weight: 0.75 },
+        { name: "set",    weight: 0.15 },
+        { name: "number", weight: 0.10 },
       ],
     });
+    const ranked = fuse.search(nameGuess).map((r) => ({ item: r.item, textScore: 1 - (r.score ?? 1) }));
 
-    const ranked = fuse.search(nameGuess);
-    const top = ranked[0]?.item || candidates[0];
+    // Apply collector number bonus
+    for (const r of ranked) {
+      if (collectorNum && String(r.item.number).toLowerCase() === String(collectorNum).toLowerCase()) {
+        r.textScore += 0.25; // boost if number matches
+      }
+    }
+
+    // Keep top N for vision check
+    const topN = ranked.sort((a, b) => b.textScore - a.textScore).slice(0, 8);
+
+    // 5) IMAGE MATCH (OpenCV.js ORB), optional if cv not ready or images missing
+    let visionScored = [];
+    if (readyCV && cv && v.readyState >= 2) {
+      setStatus("Analyzing images…");
+      // Snapshot current frame for CV (grayscale + keypoints)
+      const sceneScorePrep = await prepareMatFromCanvas(c);
+      if (sceneScorePrep) {
+        const { gray: sceneGray, des: sceneDes, kp: sceneKp, orb, bf } = sceneScorePrep;
+
+        for (const r of topN) {
+          const uri = r.item.image;
+          if (!uri) { visionScored.push({ ...r, imgScore: 0 }); continue; }
+          try {
+            const imgEl = await loadImage(uri);
+            // Try to avoid CORS taint
+            imgEl.crossOrigin = "anonymous";
+            const candMat = cv.imread(imgEl);
+            const candGray = new cv.Mat();
+            cv.cvtColor(candMat, candGray, cv.COLOR_RGBA2GRAY);
+
+            const kp = new cv.KeyPointVector();
+            const des = new cv.Mat();
+            orb.detect(candGray, kp);
+            orb.compute(candGray, kp, des);
+
+            const score = matchScoreORB(bf, sceneDes, des); // 0..1
+            visionScored.push({ ...r, imgScore: score });
+
+            // cleanup
+            kp.delete(); des.delete();
+            candGray.delete(); candMat.delete();
+          } catch {
+            // CORS or load fail → no image score
+            visionScored.push({ ...r, imgScore: 0 });
+          }
+        }
+
+        // cleanup scene mats
+        sceneKp.delete(); sceneDes.delete(); sceneGray.delete();
+        orb.delete(); bf.delete();
+      } else {
+        // couldn’t build scene features
+        visionScored = topN.map((r) => ({ ...r, imgScore: 0 }));
+      }
+    } else {
+      visionScored = topN.map((r) => ({ ...r, imgScore: 0 }));
+    }
+
+    // 6) COMBINE SCORES
+    // Weighted: 70% text, 20% image, 10% number bonus already in textScore
+    const rankedFinal = visionScored
+      .map((r) => ({ ...r, final: r.textScore * 0.7 + r.imgScore * 0.3 }))
+      .sort((a, b) => b.final - a.final);
+
+    const top = rankedFinal[0]?.item || candidates[0];
     if (!top) {
       setStatus("No match found.");
       return;
     }
 
-    // Fetch precise details via cardId (with images)
+    // 7) Fetch precise details via cardId (with images)
     const res2 = await fetch(
       `/api/cards?cardId=${encodeURIComponent(top.id)}&currency=${currency}&condition=NM`,
       { cache: "no-store" }
@@ -221,21 +280,18 @@ export default function ScanPage() {
 
     const card = json2.data[0];
     const price = bestPriceNM(card.variants);
-    setMatch({
-      card,
-      price,
-      fetchedAt: Date.now(),
-    });
-    setStatus(`Matched: ${card.name}${price ? ` — ${fmt(price.price)}` : ""}`);
-  }, [currency, printing, lastQuery]);
+    setMatch({ card, price, fetchedAt: Date.now() });
+    setStatus(
+      `Matched: ${card.name}${collectorNum ? ` (#${collectorNum})` : ""}${price ? ` — ${fmt(price.price)}` : ""}`
+    );
+  }, [currency, printing, lastQuery, readyCV]);
 
   const startLoop = useCallback(() => {
     if (loopRef.current) return;
     setScanning(true);
     setStatus("Starting scan…");
-    loopRef.current = setInterval(runOnce, 400); // schedule tries; runOnce self-throttles
+    loopRef.current = setInterval(runOnce, 400);
   }, [runOnce]);
-
   const stopLoop = useCallback(() => {
     setScanning(false);
     setStatus("Paused");
@@ -244,41 +300,32 @@ export default function ScanPage() {
       loopRef.current = null;
     }
   }, []);
-
   useEffect(() => {
-    return () => {
-      stopLoop();
-      stopCamera();
-    };
+    return () => { stopLoop(); stopCamera(); };
   }, [stopLoop, stopCamera]);
 
+  // ---------- render ----------
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900 p-6">
       <div className="max-w-6xl mx-auto">
-        <h1 className="text-3xl font-bold tracking-tight">Lorcana Live Scanner</h1>
+        <h1 className="text-3xl font-bold tracking-tight">Lorcana Live Scanner (Pro)</h1>
         <p className="text-slate-600 mt-1">
-          Hold a card with the <strong>name area</strong> near the top edge of the frame. We’ll OCR the name and show
-          <strong> Near Mint</strong> prices instantly.
+          Full-card OCR + collector-number + visual matching. Shows <strong>Near Mint</strong> prices.
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <button
             className="rounded-xl px-4 py-2 font-semibold shadow bg-slate-900 text-white hover:opacity-90 disabled:opacity-60"
-            onClick={async () => {
-              await startCamera();
-              startLoop();
-            }}
-            disabled={!ready || scanning}
+            onClick={async () => { await startCamera(); startLoop(); }}
+            disabled={!readyOCR || !readyCV || scanning}
+            title={!readyOCR ? "OCR loading…" : !readyCV ? "Vision engine loading…" : ""}
           >
-            {ready ? (scanning ? "Scanning…" : "Start camera & scan") : "Loading OCR…"}
+            {readyOCR && readyCV ? (scanning ? "Scanning…" : "Start camera & scan") : "Loading engines…"}
           </button>
 
           <button
             className="rounded-xl px-4 py-2 font-semibold border border-slate-300 bg-white hover:bg-slate-50"
-            onClick={() => {
-              stopLoop();
-              stopCamera();
-            }}
+            onClick={() => { stopLoop(); stopCamera(); }}
           >
             Stop
           </button>
@@ -304,7 +351,9 @@ export default function ScanPage() {
             <option value="Foil">Foil</option>
           </select>
 
-          <span className="text-xs text-slate-500">Status: {status}{confidence != null ? ` · OCR ~${confidence}%` : ""}</span>
+          <span className="text-xs text-slate-500">
+            Status: {status}{confidence != null ? ` · OCR ~${confidence}%` : ""}{readyCV ? "" : " · (loading vision…)"}
+          </span>
         </div>
 
         <div className="mt-4 grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6 items-start">
@@ -312,12 +361,6 @@ export default function ScanPage() {
           <div className="relative">
             <div className="aspect-video w-full overflow-hidden rounded-2xl border border-slate-200 bg-black">
               <video ref={videoRef} playsInline muted className="w-full h-full object-contain" />
-            </div>
-
-            {/* Visual guide for the top "name band" */}
-            <div className="pointer-events-none absolute inset-0 flex flex-col">
-              <div className="h-[18%] ring-2 ring-emerald-400/70 rounded-t-2xl" />
-              <div className="flex-1 bg-transparent" />
             </div>
 
             {/* Hidden canvas used for OCR snapshots */}
@@ -395,11 +438,98 @@ export default function ScanPage() {
 
         {/* Tips */}
         <ul className="mt-6 text-sm text-slate-600 list-disc list-inside space-y-1">
-          <li>For best results, keep the name bar well-lit and horizontal.</li>
-          <li>Use a neutral, non-busy background behind the card.</li>
-          <li>Phones: switch Safari/Chrome to “Request Desktop Site” if camera blocks OCR worker downloads.</li>
+          <li>Good lighting and keeping the card flat hugely improves OCR and image match.</li>
+          <li>If images don’t influence ranking, the image host might block CORS; text matching still works.</li>
+          <li>For ultra-fast scans, reduce resolution (W/H) or interval in the code (search for <code>W = 960</code> and <code>setInterval(…400)</code>).</li>
         </ul>
       </div>
     </main>
   );
+}
+
+/* -------------------- helpers (outside component) -------------------- */
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+function waitFor(testFn, timeoutMs = 15000, intervalMs = 50) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const i = setInterval(() => {
+      try {
+        if (testFn()) { clearInterval(i); resolve(true); }
+        else if (Date.now() - start > timeoutMs) { clearInterval(i); reject(new Error("waitFor timeout")); }
+      } catch (e) { clearInterval(i); reject(e); }
+    }, intervalMs);
+  });
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    // hint CORS; host must allow it
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+async function prepareMatFromCanvas(canvas) {
+  try {
+    // Build ORB features for the scene
+    const mat = cv.imread(canvas);
+    const gray = new cv.Mat();
+    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+    // Light downscale to reduce noise
+    const graySmall = new cv.Mat();
+    const fx = 0.75, fy = 0.75;
+    cv.resize(gray, graySmall, new cv.Size(0, 0), fx, fy, cv.INTER_AREA);
+
+    const kp = new cv.KeyPointVector();
+    const des = new cv.Mat();
+    const orb = new cv.ORB();     // ORB feature extractor
+    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+
+    orb.detect(graySmall, kp);
+    orb.compute(graySmall, kp, des);
+
+    mat.delete(); gray.delete();
+    return { gray: graySmall, kp, des, orb, bf };
+  } catch {
+    return null;
+  }
+}
+
+function matchScoreORB(bf, desScene, desCand) {
+  try {
+    if (desScene.empty() || desCand.empty()) return 0;
+    const matches = new cv.DMatchVectorVector();
+    bf.knnMatch(desScene, desCand, matches, 2);
+
+    // Lowe's ratio test
+    let good = 0;
+    for (let i = 0; i < matches.size(); i++) {
+      const m = matches.get(i);
+      if (m.size() >= 2) {
+        const a = m.get(0), b = m.get(1);
+        if (a.distance < 0.75 * b.distance) good++;
+      }
+      m.delete();
+    }
+    matches.delete();
+
+    // Normalize: assume 500 scene features typical; clamp 0..1
+    const score = Math.min(good / 120, 1); // 120 “good” matches ≈ strong
+    return score;
+  } catch {
+    return 0;
+  }
 }
