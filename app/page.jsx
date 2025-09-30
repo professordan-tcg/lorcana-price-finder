@@ -15,6 +15,9 @@ export default function Page() {
   const [activeIndex, setActiveIndex] = useState(-1);
   const suggestRef = useRef(null);
 
+  // Preview (click to pin)
+  const [openPreviewId, setOpenPreviewId] = useState(null);
+
   // ---- Helpers (NM-only) ----
   function expandCond(abbr) {
     const map = {
@@ -63,6 +66,7 @@ export default function Page() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error || json?.message || "Request failed");
       setResults(Array.isArray(json?.data) ? json.data : []);
+      setOpenPreviewId(null); // reset any pinned preview
     } catch (err) {
       setError(err?.message || "Something went wrong");
     } finally {
@@ -83,6 +87,7 @@ export default function Page() {
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error || json?.message || "Request failed");
       setResults(Array.isArray(json?.data) ? json.data : []);
+      setOpenPreviewId(null);
     } catch (err) {
       setError(err?.message || "Something went wrong");
     } finally {
@@ -214,7 +219,7 @@ export default function Page() {
                     }`}
                     onMouseEnter={() => setActiveIndex(i)}
                     onMouseDown={(e) => {
-                      e.preventDefault(); // prevents input blur before click
+                      e.preventDefault(); // prevents blur before click
                       chooseSuggestion(s);
                     }}
                   >
@@ -285,10 +290,12 @@ export default function Page() {
               .filter((v) => v?.condition === NM_FULL || v?.condition === NM)
               .filter((v) => !printing || (v.printing || "").toLowerCase() === printing.toLowerCase());
 
+            const previewOpen = openPreviewId === card.id;
+
             return (
-              <li key={card.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 overflow-visible">
+              <li key={card.id} className="relative bg-white rounded-2xl border border-slate-200 shadow-sm p-4 overflow-visible">
                 <div className="flex items-start gap-3">
-                  {/* IMAGE with hover zoom */}
+                  {/* IMAGE with hover preview + click to pin */}
                   {card.image && (
                     <div className="relative group shrink-0">
                       <img
@@ -296,14 +303,56 @@ export default function Page() {
                         alt={`${card.name} card image`}
                         loading="lazy"
                         tabIndex={0}
-                        className="
-                          w-20 h-auto rounded-lg border border-slate-200
-                          transition-transform duration-200 ease-out transform-gpu will-change-transform
-                          origin-left
-                          hover:scale-150 hover:shadow-2xl hover:ring-2 hover:ring-slate-200 hover:z-30
-                          focus-visible:scale-150 focus-visible:shadow-2xl focus-visible:ring-2 focus-visible:ring-slate-200 focus-visible:z-30
-                        "
+                        className="w-20 h-auto rounded-lg border border-slate-200"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setOpenPreviewId(previewOpen ? null : card.id);
+                        }}
+                        aria-expanded={previewOpen}
                       />
+
+                      {/* Hover preview (pointer-events:none so hover doesn’t flicker). */}
+                      <div
+                        className="
+                          pointer-events-none hidden group-hover:flex group-focus-within:flex
+                          absolute left-24 top-0 z-40
+                          p-2 bg-white rounded-xl border border-slate-200 shadow-2xl
+                          max-w-[min(90vw,28rem)] max-h-[80vh]
+                        "
+                      >
+                        <img
+                          src={card.imageLarge || card.image}
+                          alt={`${card.name} large preview`}
+                          className="h-auto w-[22rem] max-w-full rounded-md"
+                        />
+                      </div>
+
+                      {/* Click-to-pin preview (interactive; includes close button) */}
+                      {previewOpen && (
+                        <div
+                          className="
+                            absolute left-24 top-0 z-50
+                            p-2 bg-white rounded-xl border border-slate-200 shadow-2xl
+                            max-w-[min(90vw,32rem)] max-h-[80vh] overflow-auto
+                          "
+                        >
+                          <div className="flex justify-between items-center mb-2">
+                            <div className="text-sm font-semibold truncate pr-4">{card.name}</div>
+                            <button
+                              type="button"
+                              className="text-xs px-2 py-1 rounded-md border border-slate-200 hover:bg-slate-50"
+                              onClick={() => setOpenPreviewId(null)}
+                            >
+                              Close
+                            </button>
+                          </div>
+                          <img
+                            src={card.imageLarge || card.image}
+                            alt={`${card.name} large preview`}
+                            className="h-auto w-[26rem] max-w-full rounded-md"
+                          />
+                        </div>
+                      )}
                     </div>
                   )}
 
