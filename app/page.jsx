@@ -3,18 +3,52 @@ import React, { useEffect, useRef, useState } from "react";
 
 export default function Page() {
   const [query, setQuery] = useState("");
-  const [condition, setCondition] = useState("");
   const [printing, setPrinting] = useState("");
   const [currency, setCurrency] = useState("GBP"); // default to GBP
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState([]);
 
-  // Suggestions (type-ahead)
+  // Type-ahead state
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggest, setShowSuggest] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const suggestRef = useRef(null);
+
+  // Helper: expand NM to "Near Mint" match
+  function expandCond(abbr) {
+    const map = {
+      NM: "Near Mint",
+      LP: "Lightly Played",
+      MP: "Moderately Played",
+      HP: "Heavily Played",
+      DMG: "Damaged",
+      S: "Sealed",
+    };
+    return map[abbr] || abbr;
+  }
+  const NM = "NM";
+  const NM_FULL = expandCond(NM); // "Near Mint"
+
+  function fmt(n) {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(n);
+  }
+
+  // Best price among NM variants (respect printing filter if selected)
+  function bestPriceNM(variants = []) {
+    let vs = variants.filter(
+      (v) => v?.condition === NM_FULL || v?.condition === NM
+    );
+    if (printing) {
+      vs = vs.filter((v) => (v.printing || "").toLowerCase() === printing.toLowerCase());
+    }
+    if (!vs.length) return null;
+    let best = vs[0];
+    for (const v of vs) {
+      if (typeof v.price === "number" && (best.price == null || v.price < best.price)) best = v;
+    }
+    return best;
+  }
 
   async function handleSearch(e) {
     e?.preventDefault?.();
@@ -24,7 +58,7 @@ export default function Page() {
     try {
       const params = new URLSearchParams();
       if (query.trim()) params.set("q", query.trim());
-      if (condition) params.set("condition", condition);
+      params.set("condition", NM); // force Near Mint
       if (printing) params.set("printing", printing);
       params.set("limit", "20");
       params.set("currency", currency);
@@ -40,13 +74,13 @@ export default function Page() {
     }
   }
 
-  // Fetch a single card precisely by cardId
+  // Fetch a single card precisely by cardId (still NM enforced)
   async function fetchByCardId(cardId) {
     setLoading(true);
     setError(null);
     setResults([]);
     try {
-      const params = new URLSearchParams({ currency });
+      const params = new URLSearchParams({ currency, condition: NM });
       const res = await fetch(
         `/api/cards?cardId=${encodeURIComponent(cardId)}&${params.toString()}`,
         { cache: "no-store" }
@@ -61,43 +95,7 @@ export default function Page() {
     }
   }
 
-  function expandCond(abbr) {
-    const map = {
-      NM: "Near Mint",
-      LP: "Lightly Played",
-      MP: "Moderately Played",
-      HP: "Heavily Played",
-      DMG: "Damaged",
-      S: "Sealed",
-    };
-    return map[abbr] || abbr;
-  }
-
-  function bestPrice(variants = []) {
-    if (!variants.length) return null;
-    let vs = variants;
-    if (condition)
-      vs = vs.filter(
-        (v) => v.condition === expandCond(condition) || v.condition === condition
-      );
-    if (printing)
-      vs = vs.filter(
-        (v) => (v.printing || "").toLowerCase() === printing.toLowerCase()
-      );
-    if (!vs.length) vs = variants;
-    let best = vs[0];
-    for (const v of vs) {
-      if (typeof v.price === "number" && (best.price == null || v.price < best.price))
-        best = v;
-    }
-    return best;
-  }
-
-  function fmt(n) {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(n);
-  }
-
-  // Debounced type-ahead suggestions
+  // Debounced type-ahead suggestions (NM + images disabled for speed)
   useEffect(() => {
     const q = query.trim();
     if (q.length < 2) {
@@ -109,8 +107,14 @@ export default function Page() {
     const controller = new AbortController();
     const t = setTimeout(async () => {
       try {
-        const params = new URLSearchParams({ q, limit: "10", currency });
-        params.set("game", "disney-lorcana");
+        const params = new URLSearchParams({
+          q,
+          limit: "10",
+          currency,
+          images: "0",      // keep suggestions fast
+          condition: NM,    // only suggest NM matches
+        });
+
         const res = await fetch(`/api/cards?${params.toString()}`, {
           signal: controller.signal,
         });
@@ -125,9 +129,12 @@ export default function Page() {
           setSuggestions(items);
           setShowSuggest(true);
           setActiveIndex(-1);
+        } else {
+          setSuggestions([]);
+          setShowSuggest(false);
         }
       } catch {
-        /* typing race; ignore */
+        // typing race / abort — ignore
       }
     }, 250);
 
@@ -178,13 +185,13 @@ export default function Page() {
           Lorcana Price Finder <span className="text-slate-400">· JustTCG</span>
         </h1>
         <p className="text-slate-600 mt-1">
-          Search Lorcana cards and see current variant prices (Normal/Foil, NM/LP/etc.).
+          Search Lorcana cards and see <strong>Near Mint</strong> prices (Normal/Foil).
           Type to get instant suggestions.
         </p>
 
         <form
           onSubmit={handleSearch}
-          className="mt-5 grid gap-3 md:grid-cols-[1fr_auto_auto_auto_auto] items-end bg-white rounded-2xl shadow p-4"
+          className="mt-5 grid gap-3 md:grid-cols-[1fr_auto_auto_auto] items-end bg-white rounded-2xl shadow p-4"
         >
           <div className="flex flex-col relative" ref={suggestRef}>
             <label className="text-xs font-semibold text-slate-600">Search</label>
@@ -195,20 +202,27 @@ export default function Page() {
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}
               onFocus={() => suggestions.length > 0 && setShowSuggest(true)}
+              aria-autocomplete="list"
+              aria-expanded={showSuggest}
             />
 
             {/* Suggestions dropdown */}
             {showSuggest && suggestions.length > 0 && (
-              <ul className="absolute z-20 top-full mt-1 w-full max-h-72 overflow-auto rounded-xl border border-slate-200 bg-white shadow">
+              <ul
+                className="absolute z-20 top-full mt-1 w-full max-h-72 overflow-auto rounded-xl border border-slate-200 bg-white shadow"
+                role="listbox"
+              >
                 {suggestions.map((s, i) => (
                   <li
                     key={s.id}
+                    role="option"
+                    aria-selected={i === activeIndex}
                     className={`px-3 py-2 text-sm cursor-pointer ${
                       i === activeIndex ? "bg-slate-100" : "hover:bg-slate-50"
                     }`}
                     onMouseEnter={() => setActiveIndex(i)}
                     onMouseDown={(e) => {
-                      e.preventDefault();
+                      e.preventDefault(); // prevent blur before click
                       chooseSuggestion(s);
                     }}
                   >
@@ -220,23 +234,6 @@ export default function Page() {
                 ))}
               </ul>
             )}
-          </div>
-
-          <div className="flex flex-col">
-            <label className="text-xs font-semibold text-slate-600">Condition</label>
-            <select
-              className="mt-1 rounded-xl border border-slate-200 px-3 py-2"
-              value={condition}
-              onChange={(e) => setCondition(e.target.value)}
-            >
-              <option value="">Any</option>
-              <option value="NM">Near Mint (NM)</option>
-              <option value="LP">Lightly Played (LP)</option>
-              <option value="MP">Moderately Played (MP)</option>
-              <option value="HP">Heavily Played (HP)</option>
-              <option value="DMG">Damaged (DMG)</option>
-              <option value="S">Sealed</option>
-            </select>
           </div>
 
           <div className="flex flex-col">
@@ -275,7 +272,7 @@ export default function Page() {
 
         <div className="mt-3 text-xs text-slate-500">
           Data via <code>/api/cards</code> → JustTCG <code>GET /v1/cards</code>. Prices shown in{" "}
-          {currency}.
+          {currency}. Condition fixed to <strong>Near Mint</strong>.
         </div>
 
         {error && (
@@ -294,7 +291,14 @@ export default function Page() {
 
         <ul className="mt-6 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {results.map((card) => {
-            const best = bestPrice(card.variants);
+            const best = bestPriceNM(card.variants || []);
+            // Only NM rows for the table:
+            const nmRows = (card.variants || []).filter(
+              (v) => v?.condition === NM_FULL || v?.condition === NM
+            ).filter(
+              (v) => !printing || (v.printing || "").toLowerCase() === printing.toLowerCase()
+            );
+
             return (
               <li
                 key={card.id}
@@ -321,35 +325,33 @@ export default function Page() {
 
                       {best && (
                         <div className="text-right">
-                          <div className="text-xs uppercase tracking-wide text-slate-500">
-                            From
+                          <div className="text-[10px] uppercase tracking-wide text-slate-500">
+                            From (Near Mint)
                           </div>
                           <div className="text-lg font-extrabold">
                             {typeof best.price === "number" ? fmt(best.price) : "—"}
                           </div>
                           <div className="text-[10px] text-slate-400">
-                            {best.printing || "—"} · {best.condition || "—"}
+                            {best.printing || "—"}
                           </div>
                         </div>
                       )}
                     </div>
 
-                    {Array.isArray(card.variants) && card.variants.length > 0 ? (
+                    {nmRows.length > 0 ? (
                       <div className="mt-3 overflow-hidden rounded-xl border border-slate-100">
                         <table className="w-full text-sm">
                           <thead className="bg-slate-50 text-slate-600">
                             <tr>
                               <th className="text-left px-3 py-2">Printing</th>
-                              <th className="text-left px-3 py-2">Condition</th>
-                              <th className="text-right px-3 py-2">Price</th>
+                              <th className="text-right px-3 py-2">Price (NM)</th>
                               <th className="text-right px-3 py-2">Updated</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {card.variants.map((v) => (
+                            {nmRows.map((v) => (
                               <tr key={v.id} className="odd:bg-white even:bg-slate-50/50">
                                 <td className="px-3 py-2">{v.printing || "—"}</td>
-                                <td className="px-3 py-2">{v.condition || "—"}</td>
                                 <td className="px-3 py-2 text-right">
                                   {typeof v.price === "number" ? fmt(v.price) : "—"}
                                 </td>
@@ -365,7 +367,7 @@ export default function Page() {
                       </div>
                     ) : (
                       <div className="text-sm text-slate-500 mt-2">
-                        No variant pricing available.
+                        No Near Mint pricing available.
                       </div>
                     )}
                   </div>
@@ -378,4 +380,3 @@ export default function Page() {
     </main>
   );
 }
-
