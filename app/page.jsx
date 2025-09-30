@@ -15,7 +15,7 @@ export default function Page() {
   const [activeIndex, setActiveIndex] = useState(-1);
   const suggestRef = useRef(null);
 
-  // Helper: expand NM to "Near Mint" match
+  // ---- Helpers (NM-only) ----
   function expandCond(abbr) {
     const map = {
       NM: "Near Mint",
@@ -34,14 +34,9 @@ export default function Page() {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(n);
   }
 
-  // Best price among NM variants (respect printing filter if selected)
   function bestPriceNM(variants = []) {
-    let vs = variants.filter(
-      (v) => v?.condition === NM_FULL || v?.condition === NM
-    );
-    if (printing) {
-      vs = vs.filter((v) => (v.printing || "").toLowerCase() === printing.toLowerCase());
-    }
+    let vs = variants.filter((v) => v?.condition === NM_FULL || v?.condition === NM);
+    if (printing) vs = vs.filter((v) => (v.printing || "").toLowerCase() === printing.toLowerCase());
     if (!vs.length) return null;
     let best = vs[0];
     for (const v of vs) {
@@ -50,6 +45,7 @@ export default function Page() {
     return best;
   }
 
+  // ---- Fetchers ----
   async function handleSearch(e) {
     e?.preventDefault?.();
     setLoading(true);
@@ -74,7 +70,6 @@ export default function Page() {
     }
   }
 
-  // Fetch a single card precisely by cardId (still NM enforced)
   async function fetchByCardId(cardId) {
     setLoading(true);
     setError(null);
@@ -95,7 +90,7 @@ export default function Page() {
     }
   }
 
-  // Debounced type-ahead suggestions (NM + images disabled for speed)
+  // ---- Type-ahead (debounced, NM-only, images off for speed) ----
   useEffect(() => {
     const q = query.trim();
     if (q.length < 2) {
@@ -112,9 +107,8 @@ export default function Page() {
           limit: "10",
           currency,
           images: "0",      // keep suggestions fast
-          condition: NM,    // only suggest NM matches
+          condition: NM,    // NM only suggestions
         });
-
         const res = await fetch(`/api/cards?${params.toString()}`, {
           signal: controller.signal,
         });
@@ -134,7 +128,7 @@ export default function Page() {
           setShowSuggest(false);
         }
       } catch {
-        // typing race / abort — ignore
+        // ignore aborted / races
       }
     }, 250);
 
@@ -185,8 +179,7 @@ export default function Page() {
           Lorcana Price Finder <span className="text-slate-400">· JustTCG</span>
         </h1>
         <p className="text-slate-600 mt-1">
-          Search Lorcana cards and see <strong>Near Mint</strong> prices (Normal/Foil).
-          Type to get instant suggestions.
+          Search Lorcana cards and see <strong>Near Mint</strong> prices (Normal/Foil). Type to get instant suggestions.
         </p>
 
         <form
@@ -206,7 +199,6 @@ export default function Page() {
               aria-expanded={showSuggest}
             />
 
-            {/* Suggestions dropdown */}
             {showSuggest && suggestions.length > 0 && (
               <ul
                 className="absolute z-20 top-full mt-1 w-full max-h-72 overflow-auto rounded-xl border border-slate-200 bg-white shadow"
@@ -222,7 +214,7 @@ export default function Page() {
                     }`}
                     onMouseEnter={() => setActiveIndex(i)}
                     onMouseDown={(e) => {
-                      e.preventDefault(); // prevent blur before click
+                      e.preventDefault(); // prevents input blur before click
                       chooseSuggestion(s);
                     }}
                   >
@@ -271,8 +263,7 @@ export default function Page() {
         </form>
 
         <div className="mt-3 text-xs text-slate-500">
-          Data via <code>/api/cards</code> → JustTCG <code>GET /v1/cards</code>. Prices shown in{" "}
-          {currency}. Condition fixed to <strong>Near Mint</strong>.
+          Data via <code>/api/cards</code> → JustTCG <code>GET /v1/cards</code>. Prices shown in {currency}. Condition fixed to <strong>Near Mint</strong>.
         </div>
 
         {error && (
@@ -282,9 +273,7 @@ export default function Page() {
         )}
 
         {!loading && !error && results.length === 0 && (
-          <div className="mt-6 text-slate-500">
-            No results yet. Try searching for a card name, set, or number.
-          </div>
+          <div className="mt-6 text-slate-500">No results yet. Try searching for a card name, set, or number.</div>
         )}
 
         {loading && <div className="mt-6 text-slate-600">Fetching live prices…</div>}
@@ -292,26 +281,30 @@ export default function Page() {
         <ul className="mt-6 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {results.map((card) => {
             const best = bestPriceNM(card.variants || []);
-            // Only NM rows for the table:
-            const nmRows = (card.variants || []).filter(
-              (v) => v?.condition === NM_FULL || v?.condition === NM
-            ).filter(
-              (v) => !printing || (v.printing || "").toLowerCase() === printing.toLowerCase()
-            );
+            const nmRows = (card.variants || [])
+              .filter((v) => v?.condition === NM_FULL || v?.condition === NM)
+              .filter((v) => !printing || (v.printing || "").toLowerCase() === printing.toLowerCase());
 
             return (
-              <li
-                key={card.id}
-                className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4"
-              >
+              <li key={card.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 overflow-visible">
                 <div className="flex items-start gap-3">
+                  {/* IMAGE with hover zoom */}
                   {card.image && (
-                    <img
-                      src={card.image}
-                      alt={`${card.name} card image`}
-                      loading="lazy"
-                      className="w-20 h-auto rounded-lg border border-slate-200 shrink-0"
-                    />
+                    <div className="relative group shrink-0">
+                      <img
+                        src={card.image}
+                        alt={`${card.name} card image`}
+                        loading="lazy"
+                        tabIndex={0}
+                        className="
+                          w-20 h-auto rounded-lg border border-slate-200
+                          transition-transform duration-200 ease-out transform-gpu will-change-transform
+                          origin-left
+                          hover:scale-150 hover:shadow-2xl hover:ring-2 hover:ring-slate-200 hover:z-30
+                          focus-visible:scale-150 focus-visible:shadow-2xl focus-visible:ring-2 focus-visible:ring-slate-200 focus-visible:z-30
+                        "
+                      />
+                    </div>
                   )}
 
                   <div className="flex-1">
@@ -325,15 +318,11 @@ export default function Page() {
 
                       {best && (
                         <div className="text-right">
-                          <div className="text-[10px] uppercase tracking-wide text-slate-500">
-                            From (Near Mint)
-                          </div>
+                          <div className="text-[10px] uppercase tracking-wide text-slate-500">From (Near Mint)</div>
                           <div className="text-lg font-extrabold">
                             {typeof best.price === "number" ? fmt(best.price) : "—"}
                           </div>
-                          <div className="text-[10px] text-slate-400">
-                            {best.printing || "—"}
-                          </div>
+                          <div className="text-[10px] text-slate-400">{best.printing || "—"}</div>
                         </div>
                       )}
                     </div>
@@ -356,9 +345,7 @@ export default function Page() {
                                   {typeof v.price === "number" ? fmt(v.price) : "—"}
                                 </td>
                                 <td className="px-3 py-2 text-right">
-                                  {v.lastUpdated
-                                    ? new Date(v.lastUpdated * 1000).toLocaleDateString()
-                                    : "—"}
+                                  {v.lastUpdated ? new Date(v.lastUpdated * 1000).toLocaleDateString() : "—"}
                                 </td>
                               </tr>
                             ))}
@@ -366,9 +353,7 @@ export default function Page() {
                         </table>
                       </div>
                     ) : (
-                      <div className="text-sm text-slate-500 mt-2">
-                        No Near Mint pricing available.
-                      </div>
+                      <div className="text-sm text-slate-500 mt-2">No Near Mint pricing available.</div>
                     )}
                   </div>
                 </div>
